@@ -239,19 +239,19 @@ static uint16_t in_cksum(const void *buffer, size_t bufferLen)
     // 16-bit unit.
     
     icmpPtr->checksum = in_cksum([packet bytes], [packet length]);
-    
-    CFSocketNativeHandle sock = CFSocketGetNative(self->_socket);
-    struct timeval tv;
-    tv.tv_sec  = 0;
-    tv.tv_usec = 10000; // 0.1 sec
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *)&tv, sizeof(tv));
-    
+
     // Send the packet.
-    
+    // Check socket BEFORE using it
     if (self->_socket == NULL) {
         bytesSent = -1;
         err = EBADF;
     } else {
+        CFSocketNativeHandle sock = CFSocketGetNative(self->_socket);
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 10000; // 0.1 sec
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void *)&tv, sizeof(tv));
+
         bytesSent = sendto(
             CFSocketGetNative(self->_socket),
             [packet bytes],
@@ -298,12 +298,17 @@ static uint16_t in_cksum(const void *buffer, size_t bufferLen)
     NSUInteger              result;
     const struct IPHeader * ipPtr;
     size_t                  ipHeaderLength;
-    
+
     result = NSNotFound;
     if ([packet length] >= (sizeof(IPHeader) + sizeof(ICMPHeader))) {
         ipPtr = (const IPHeader *) [packet bytes];
-        assert((ipPtr->versionAndHeaderLength & 0xF0) == 0x40);     // IPv4
-        assert(ipPtr->protocol == 1);                               // ICMP
+        // Runtime validation instead of assert (assert is disabled in Release builds)
+        if ((ipPtr->versionAndHeaderLength & 0xF0) != 0x40) {     // Not IPv4
+            return NSNotFound;
+        }
+        if (ipPtr->protocol != 1) {                               // Not ICMP
+            return NSNotFound;
+        }
         ipHeaderLength = (ipPtr->versionAndHeaderLength & 0x0F) * sizeof(uint32_t);
         if ([packet length] >= (ipHeaderLength + sizeof(ICMPHeader))) {
             result = ipHeaderLength;
