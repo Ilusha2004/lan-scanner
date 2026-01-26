@@ -48,6 +48,9 @@
 @property(nonatomic, retain) NSString *netMask;
 @property(nonatomic) NSInteger baseAddressEnd;
 @property(nonatomic, retain) NSMutableDictionary *brandDictionary;
+@property(nonatomic, strong) dispatch_queue_t addressQueue;
+@property(nonatomic, strong) NSMutableArray<NSURLSessionDataTask *> *activeTasks;
+@property(nonatomic, strong) dispatch_queue_t tasksQueue;
 
 @end
 
@@ -104,20 +107,48 @@
 }
 
 - (void)start {
+    // Invalidate any existing timer to prevent double-run issues
+    [self.timer invalidate];
+    self.timer = nil;
+
+    // Initialize synchronization queues first (before using them)
+    if (self.addressQueue == nil) {
+        self.addressQueue = dispatch_queue_create("com.lanscan.addressQueue", DISPATCH_QUEUE_SERIAL);
+    }
+    if (self.tasksQueue == nil) {
+        self.tasksQueue = dispatch_queue_create("com.lanscan.tasksQueue", DISPATCH_QUEUE_SERIAL);
+    }
+    if (self.activeTasks == nil) {
+        self.activeTasks = [NSMutableArray new];
+    }
+
+    // Cancel any active URLSession tasks
+    dispatch_sync(self.tasksQueue, ^{
+        for (NSURLSessionDataTask *task in self.activeTasks) {
+            [task cancel];
+        }
+        [self.activeTasks removeAllObjects];
+    });
+
+    // Reset state for a fresh scan
+    self.baseAddress = nil;
+    self.currentHostAddress = 0;
+    self.baseAddressEnd = 0;
+
     // Initializing the dictionary that holds the Brands name for each MAC Address
-    
+
     self.brandDictionary = [[NSDictionary
                              dictionaryWithContentsOfFile:[SWIFTPM_MODULE_BUNDLE
                                                            pathForResource:@"data"
                                                            ofType:@"plist"]] mutableCopy];
-    
+
     // Initializing the dictionary that holds the Brands downloaded from the
     // internet
     NSMutableDictionary *vendors = [self downloadedVendorsDictionary];
     if (![self isEmpty:vendors]) {
         [self.brandDictionary addEntriesFromDictionary:vendors];
     }
-    
+
     self.localAddress = [self localIPAddress];
     NSArray *a = [self.localAddress componentsSeparatedByString:@"."];
     NSArray *b = [self.netMask componentsSeparatedByString:@"."];
@@ -146,13 +177,54 @@
 - (void)stop {
     [self.timer invalidate];
     self.timer = nil;
+
+    // Cancel all active URLSession tasks to prevent use-after-free
+    if (self.tasksQueue != nil && self.activeTasks != nil) {
+        dispatch_sync(self.tasksQueue, ^{
+            for (NSURLSessionDataTask *task in self.activeTasks) {
+                [task cancel];
+            }
+            [self.activeTasks removeAllObjects];
+        });
+    }
 }
 
 - (void)probeNetwork {
-    // Расчет IP адреса для текущего хоста
+    // Safety check - addressQueue must be initialized
+    if (self.addressQueue == nil) {
+        return;
+    }
+
+    // Synchronized read-and-increment of currentHostAddress
+    __block NSInteger currentAddress;
+    __block BOOL shouldFinish = NO;
+
+    dispatch_sync(self.addressQueue, ^{
+        currentAddress = self.currentHostAddress;
+        self.currentHostAddress++;
+        if (currentAddress >= MAX_IP_RANGE) {
+            shouldFinish = YES;
+        }
+    });
+
+    // Check if we should finish before processing
+    if (shouldFinish) {
+        // Capture strong reference to delegate before async call
+        id<LANScanDelegate> strongDelegate = self.delegate;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.timer invalidate];
+            self.timer = nil;
+            if (strongDelegate != nil) {
+                [strongDelegate lanScanDidFinishScanning];
+            }
+        });
+        return;
+    }
+
+    // Calculate IP address for current host
     NSString *deviceIPAddress =
         [[[[NSString stringWithFormat:@"%@%ld", self.baseAddress,
-            (long)self.currentHostAddress]
+            (long)currentAddress]
            stringByReplacingOccurrencesOfString:@".0"
            withString:@"."]
           stringByReplacingOccurrencesOfString:@".00"
@@ -160,13 +232,16 @@
          stringByReplacingOccurrencesOfString:@".."
          withString:@".0."];
 
-    // Обновляем прогресс сразу (UI только здесь!)
+    // Capture strong reference to delegate for progress update
+    id<LANScanDelegate> strongDelegateProgress = self.delegate;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.delegate lanScanHasUpdatedProgress:self.currentHostAddress
-                                         address:deviceIPAddress];
+        if (strongDelegateProgress != nil) {
+            [strongDelegateProgress lanScanHasUpdatedProgress:currentAddress
+                                                     address:deviceIPAddress];
+        }
     });
 
-    // Тяжелую работу уносим в background
+    // Do heavy work in background
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
 
         if (deviceIPAddress != nil) {
@@ -196,8 +271,8 @@
                         NSURLSessionDataTask *task = [session
                                                       dataTaskWithURL:url
                                                       completionHandler:^(NSData *data, NSURLResponse *response,
-                                                                          NSError *error) {
-                            if (error == nil && data != nil && ![self isEmpty:data]) {
+                                                                          NSError *taskError) {
+                            if (taskError == nil && data != nil && ![self isEmpty:data]) {
                                 NSString *brand =
                                     [[NSString alloc] initWithData:data
                                                           encoding:NSUTF8StringEncoding];
@@ -210,13 +285,42 @@
                                         vendors[[self makeKeyFromMAC:deviceMac]] = brand;
                                         [vendors writeToFile:path atomically:YES];
                                     }
-                                    // Обновим brand в переменной для делегата:
+                                    // Update brand for delegate
                                     deviceBrand = brand;
                                 }
                             }
 
-                            // Сообщаем о найденном устройстве на главном потоке после получения бренда
+                            // Capture strong reference to delegate
+                            id<LANScanDelegate> strongDelegate = self.delegate;
                             dispatch_async(dispatch_get_main_queue(), ^{
+                                if (strongDelegate != nil) {
+                                    NSDictionary *dict = [[NSDictionary alloc]
+                                                          initWithObjectsAndKeys:deviceHostName != nil ? deviceHostName : @"",
+                                                          DEVICE_NAME,
+                                                          deviceIPAddress != nil ? deviceIPAddress : @"",
+                                                          DEVICE_IP_ADDRESS,
+                                                          deviceMac != nil ? deviceMac : @"",
+                                                          DEVICE_MAC,
+                                                          deviceBrand != nil ? deviceBrand : @"",
+                                                          DEVICE_BRAND, nil];
+
+                                    [strongDelegate lanScanDidFindNewDevice:dict];
+                                }
+                            });
+                        }];
+
+                        // Track the task before resuming
+                        if (self.tasksQueue != nil && self.activeTasks != nil) {
+                            dispatch_sync(self.tasksQueue, ^{
+                                [self.activeTasks addObject:task];
+                            });
+                        }
+                        [task resume];
+                    } else {
+                        // Capture strong reference to delegate
+                        id<LANScanDelegate> strongDelegate = self.delegate;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            if (strongDelegate != nil) {
                                 NSDictionary *dict = [[NSDictionary alloc]
                                                       initWithObjectsAndKeys:deviceHostName != nil ? deviceHostName : @"",
                                                       DEVICE_NAME,
@@ -227,42 +331,14 @@
                                                       deviceBrand != nil ? deviceBrand : @"",
                                                       DEVICE_BRAND, nil];
 
-                                [self.delegate lanScanDidFindNewDevice:dict];
-                            });
-                        }];
-                        [task resume];
-                    } else {
-                        // Сообщаем о найденном устройстве сразу на главном потоке
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            NSDictionary *dict = [[NSDictionary alloc]
-                                                  initWithObjectsAndKeys:deviceHostName != nil ? deviceHostName : @"",
-                                                  DEVICE_NAME,
-                                                  deviceIPAddress != nil ? deviceIPAddress : @"",
-                                                  DEVICE_IP_ADDRESS,
-                                                  deviceMac != nil ? deviceMac : @"",
-                                                  DEVICE_MAC,
-                                                  deviceBrand != nil ? deviceBrand : @"",
-                                                  DEVICE_BRAND, nil];
-
-                            [self.delegate lanScanDidFindNewDevice:dict];
+                                [strongDelegate lanScanDidFindNewDevice:dict];
+                            }
                         });
                     }
                 }
             }];
             [pingOperation start];
         }
-
-        // После последнего адреса — остановить таймер и вызвать делегат завершения на главном потоке
-        if (self.currentHostAddress >= MAX_IP_RANGE) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self.timer invalidate];
-                self.timer = nil;
-                [self.delegate lanScanDidFinishScanning];
-            });
-        }
-
-        // Инкремент адреса (делаем это в фоновом потоке, если логика требует)
-        self.currentHostAddress++;
     });
 }
 
@@ -276,9 +352,12 @@
 }
 
 - (NSString *)ip2mac:(NSString *)strIP {
-    
+
     const char *ip = [strIP UTF8String];
-    
+    if (ip == NULL) {
+        return nil;
+    }
+
     int sockfd = 0;
     unsigned char buf[BUFLEN];
     unsigned char buf2[BUFLEN];
@@ -287,8 +366,13 @@
     struct sockaddr_in *sin;
     memset(buf, 0, sizeof(buf));
     memset(buf2, 0, sizeof(buf2));
-    
+
     sockfd = socket(AF_ROUTE, SOCK_RAW, 0);
+    // Check if socket creation failed
+    if (sockfd < 0) {
+        return nil;
+    }
+
     rtm = (struct rt_msghdr *)buf;
     rtm->rtm_msglen = sizeof(struct rt_msghdr) + sizeof(struct sockaddr_in);
     rtm->rtm_version = RTM_VERSION;
@@ -297,18 +381,32 @@
     rtm->rtm_flags = RTF_LLINFO;
     rtm->rtm_pid = getpid();
     rtm->rtm_seq = SEQ;
-    
+
     sin = (struct sockaddr_in *)(rtm + 1);
     sin->sin_len = sizeof(struct sockaddr_in);
     sin->sin_family = AF_INET;
     sin->sin_addr.s_addr = inet_addr(ip);
-    write(sockfd, rtm, rtm->rtm_msglen);
-    
+
+    // Check write result
+    ssize_t written = write(sockfd, rtm, rtm->rtm_msglen);
+    if (written < 0) {
+        close(sockfd);
+        return nil;
+    }
+
     n = read(sockfd, buf2, BUFLEN);
     close(sockfd);
-    
-    if (n != 0) {
+
+    if (n > 0) {
+        // Bounds check: ensure we have enough data to read MAC address
         int index = sizeof(struct rt_msghdr) + sizeof(struct sockaddr_inarp) + 8;
+        int macEndIndex = index + 5; // We need 6 bytes for MAC address
+
+        if (macEndIndex >= n || macEndIndex >= BUFLEN) {
+            // Not enough data in buffer
+            return nil;
+        }
+
         NSString *macAddress = [NSString
                                 stringWithFormat:@"%2.2x:%2.2x:%2.2x:%2.2x:%2.2x:%2.2x",
                                 buf2[index + 0], buf2[index + 1], buf2[index + 2],
@@ -365,26 +463,30 @@
     
     CFHostRef hostRef = CFHostCreateWithAddress(kCFAllocatorDefault, addressRef);
     if (hostRef == nil) {
+        CFRelease(addressRef);
         return backupHostName;
     }
     CFRelease(addressRef);
-    
+
     BOOL succeeded = CFHostStartInfoResolution(hostRef, kCFHostNames, NULL);
     if (!succeeded) {
+        CFRelease(hostRef);
         return backupHostName;
     }
-    
+
     CFArrayRef hostnamesRef = CFHostGetNames(hostRef, NULL);
     NSInteger count = [(__bridge NSArray *)hostnamesRef count];
     if (count == 1) {
-        return [(__bridge NSArray *)hostnamesRef objectAtIndex:0];
+        NSString *result = [(__bridge NSArray *)hostnamesRef objectAtIndex:0];
+        CFRelease(hostRef);
+        return result;
     }
-    
+
     NSMutableString *hostnames = [NSMutableString new];
     for (int currentIndex = 0; currentIndex < count; currentIndex++) {
         NSString *name =
         [(__bridge NSArray *)hostnamesRef objectAtIndex:currentIndex];
-        
+
         if (currentIndex == 0) {
             [hostnames appendString:name];
             [hostnames appendString:@" ("];
@@ -398,7 +500,8 @@
             [hostnames appendString:@")"];
         }
     }
-    
+
+    CFRelease(hostRef);
     return hostnames;
 }
 
@@ -560,7 +663,12 @@
     }
     if (l > 0) {
         buf = malloc(l);
+        // Check for malloc failure
+        if (buf == NULL) {
+            return -1;
+        }
         if (sysctl(mib, sizeof(mib) / sizeof(int), buf, &l, 0, 0) < 0) {
+            free(buf);
             return -1;
         }
         for (p = buf; p < buf + l; p += rt->rtm_msglen) {
